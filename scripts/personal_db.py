@@ -15,9 +15,11 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 WORKSPACE = PLUGIN_ROOT.parents[1] if len(PLUGIN_ROOT.parents) > 1 else Path.cwd()
 LOCAL_WORKSPACE_DB = WORKSPACE / "personal-data" / "db" / "main.sqlite"
 FALLBACK_DB = Path.home() / ".local" / "share" / "openclaw-personal-database" / "main.sqlite"
+SCHEMA_VERSION = 2
+FTS_TABLES = {"entities_fts", "library_items_fts", "text_chunks_fts"}
 CORE_TABLES = {
     "sources", "raw_imports", "entities", "events", "facts", "links", "tags", "text_chunks",
-    "library_items", "library_highlights", "digests", "digest_items",
+    "library_items", "library_highlights", "digests", "digest_items", "migrations", *FTS_TABLES,
 }
 WRITE_SQL_RE = re.compile(r"\b(attach|alter|create|delete|detach|drop|insert|pragma|replace|update|vacuum)\b", re.I)
 
@@ -106,14 +108,82 @@ def connect(args):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = DELETE")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA temp_store = MEMORY")
     return conn
 
 
-def init_schema(conn):
+def schema_version(conn):
+    return int(conn.execute("PRAGMA user_version").fetchone()[0])
+
+
+def set_schema_version(conn, version):
+    conn.execute(f"PRAGMA user_version = {int(version)}")
+
+
+def record_migration(conn, version, name):
+    conn.execute(
+        "INSERT OR IGNORE INTO migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        (version, name, now_iso()),
+    )
+
+
+def fts_query(text):
+    tokens = re.findall(r"[A-Za-z0-9_]+", text or "")
+    return " ".join(f'"{token}"' for token in tokens)
+
+
+def fts_available(conn):
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp.personal_db_fts_probe")
+        conn.execute("CREATE VIRTUAL TABLE temp.personal_db_fts_probe USING fts5(value)")
+        conn.execute("DROP TABLE temp.personal_db_fts_probe")
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def ensure_fts_schema(conn):
+    if not fts_available(conn):
+        return False
     conn.executescript(
         """
+        CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(entity_id UNINDEXED, type UNINDEXED, title, subtitle, url, metadata, tokenize='unicode61');
+        CREATE VIRTUAL TABLE IF NOT EXISTS library_items_fts USING fts5(library_item_id UNINDEXED, entity_id UNINDEXED, title, author, publisher, url, tags, tokenize='unicode61');
+        CREATE VIRTUAL TABLE IF NOT EXISTS text_chunks_fts USING fts5(chunk_id UNINDEXED, entity_id UNINDEXED, title, chunk_text, tokenize='unicode61');
+        """
+    )
+    return True
+
+
+def rebuild_fts(conn):
+    if not ensure_fts_schema(conn):
+        return {"available": False, "rebuilt": False}
+    conn.execute("DELETE FROM entities_fts")
+    conn.execute("DELETE FROM library_items_fts")
+    conn.execute("DELETE FROM text_chunks_fts")
+    conn.execute(
+        "INSERT INTO entities_fts (entity_id, type, title, subtitle, url, metadata) SELECT id, type, title, coalesce(subtitle, ''), coalesce(url, ''), metadata FROM entities"
+    )
+    conn.execute(
+        "INSERT INTO library_items_fts (library_item_id, entity_id, title, author, publisher, url, tags) SELECT id, entity_id, title, coalesce(author, ''), coalesce(publisher, ''), coalesce(url, ''), tags FROM library_items"
+    )
+    conn.execute(
+        "INSERT INTO text_chunks_fts (chunk_id, entity_id, title, chunk_text) SELECT text_chunks.id, text_chunks.entity_id, entities.title, text_chunks.chunk_text FROM text_chunks JOIN entities ON entities.id = text_chunks.entity_id"
+    )
+    return {"available": True, "rebuilt": True}
+
+
+def init_schema(conn):
+    current = schema_version(conn)
+    if current > SCHEMA_VERSION:
+        raise SystemExit(f"Database schema version {current} is newer than this CLI supports ({SCHEMA_VERSION})")
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
         CREATE TABLE IF NOT EXISTS raw_imports (id TEXT PRIMARY KEY, source_id TEXT NOT NULL REFERENCES sources(id), imported_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), original_path TEXT, sha256 TEXT, metadata TEXT NOT NULL DEFAULT '{}');
         CREATE TABLE IF NOT EXISTS entities (id TEXT PRIMARY KEY, type TEXT NOT NULL, canonical_key TEXT NOT NULL, title TEXT NOT NULL, subtitle TEXT, url TEXT, metadata TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), UNIQUE (type, canonical_key));
@@ -129,10 +199,28 @@ def init_schema(conn):
         CREATE TABLE IF NOT EXISTS digest_items (digest_id TEXT NOT NULL REFERENCES digests(id) ON DELETE CASCADE, library_item_id TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE, position INTEGER NOT NULL, chapter_path TEXT, build_mode TEXT, metadata TEXT NOT NULL DEFAULT '{}', PRIMARY KEY (digest_id, position));
         """
     )
+    if current < 1:
+        record_migration(conn, 1, "core schema")
+    if current < 2:
+        rebuild_fts(conn)
+        record_migration(conn, 2, "fts search indexes")
+    else:
+        ensure_fts_schema(conn)
+    set_schema_version(conn, SCHEMA_VERSION)
+    conn.commit()
 
 
 def rows_to_dicts(rows):
     return [dict(row) for row in rows]
+
+
+def is_fts_shadow_table(name):
+    return any(name.startswith(f"{table}_") for table in FTS_TABLES)
+
+
+def user_table_names(conn):
+    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
+    return [row["name"] for row in rows if not is_fts_shadow_table(row["name"])]
 
 
 def print_result(args, result):
@@ -190,24 +278,25 @@ def parse_set_values(values):
 def cmd_init(conn, args):
     init_schema(conn)
     conn.commit()
-    return {"ok": True, "dbPath": str(resolved_db_path(args))}
+    return {"ok": True, "dbPath": str(resolved_db_path(args)), "schemaVersion": schema_version(conn)}
 
 
 def cmd_stats(conn, args):
     init_schema(conn)
     return {
         "dbPath": str(resolved_db_path(args)),
+        "schemaVersion": schema_version(conn),
+        "ftsAvailable": fts_available(conn),
         "sources": conn.execute("SELECT count(*) AS count FROM sources").fetchone()["count"],
         "entities": rows_to_dicts(conn.execute("SELECT type, count(*) AS count FROM entities GROUP BY type ORDER BY type")),
         "library": dict(conn.execute("SELECT count(*) AS total, sum(read) AS read, sum(in_queue) AS in_queue, coalesce(sum(highlight_count), 0) AS highlight_count FROM library_items").fetchone()),
         "digests": dict(conn.execute("SELECT count(*) AS total, sum(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent FROM digests").fetchone()),
-        "tables": len(rows_to_dicts(conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"))),
+        "tables": len(user_table_names(conn)),
     }
 
 
 def cmd_table_list(conn, args):
-    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()
-    return [{"name": row["name"], "core": row["name"] in CORE_TABLES} for row in rows]
+    return [{"name": name, "core": name in CORE_TABLES} for name in user_table_names(conn)]
 
 
 def cmd_table_describe(conn, args):
@@ -248,7 +337,7 @@ def cmd_table_add_column(conn, args):
 
 def cmd_table_drop(conn, args):
     table = valid_identifier(args.table)
-    if table in CORE_TABLES:
+    if table in CORE_TABLES or is_fts_shadow_table(table):
         raise SystemExit(f"Refusing to drop core table: {table}")
     if not args.force:
         raise SystemExit("table drop requires --force")
@@ -257,6 +346,72 @@ def cmd_table_drop(conn, args):
     conn.execute(f"DROP TABLE {table}")
     conn.commit()
     return {"dropped": table}
+
+
+def cmd_doctor(conn, args):
+    init_schema(conn)
+    integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    foreign_key_rows = rows_to_dicts(conn.execute("PRAGMA foreign_key_check"))
+    table_counts = {}
+    for name in user_table_names(conn):
+        if name in FTS_TABLES:
+            continue
+        table_counts[name] = conn.execute(f"SELECT count(*) AS count FROM {name}").fetchone()["count"]
+    fts_tables = {
+        name: bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone())
+        for name in sorted(FTS_TABLES)
+    }
+    result = {
+        "ok": integrity == "ok" and not foreign_key_rows and schema_version(conn) == SCHEMA_VERSION,
+        "dbPath": str(resolved_db_path(args)),
+        "schemaVersion": schema_version(conn),
+        "expectedSchemaVersion": SCHEMA_VERSION,
+        "journalMode": conn.execute("PRAGMA journal_mode").fetchone()[0],
+        "synchronous": conn.execute("PRAGMA synchronous").fetchone()[0],
+        "busyTimeoutMs": conn.execute("PRAGMA busy_timeout").fetchone()[0],
+        "foreignKeys": bool(conn.execute("PRAGMA foreign_keys").fetchone()[0]),
+        "integrityCheck": integrity,
+        "foreignKeyErrors": foreign_key_rows,
+        "ftsAvailable": fts_available(conn),
+        "ftsTables": fts_tables,
+        "tableCounts": table_counts,
+    }
+    return result
+
+
+def cmd_checkpoint(conn, args):
+    init_schema(conn)
+    conn.commit()
+    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    return {"checkpoint": {"busy": row[0], "logFrames": row[1], "checkpointedFrames": row[2]}}
+
+
+def cmd_optimize(conn, args):
+    init_schema(conn)
+    conn.execute("PRAGMA optimize")
+    if ensure_fts_schema(conn):
+        for table in sorted(FTS_TABLES):
+            conn.execute(f"INSERT INTO {table}({table}) VALUES('optimize')")
+    conn.commit()
+    return {"optimized": True}
+
+
+def cmd_fts_status(conn, args):
+    init_schema(conn)
+    return {
+        "available": fts_available(conn),
+        "tables": {
+            name: bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone())
+            for name in sorted(FTS_TABLES)
+        },
+    }
+
+
+def cmd_fts_rebuild(conn, args):
+    init_schema(conn)
+    result = rebuild_fts(conn)
+    conn.commit()
+    return result
 
 
 def table_columns(conn, table):
@@ -339,12 +494,27 @@ def cmd_entity_add(conn, args):
         (entity_id, args.type, key, args.title, args.subtitle, args.url, json_dumps(parse_json_object(args.metadata)), now_iso()),
     )
     row = conn.execute("SELECT * FROM entities WHERE type=? AND canonical_key=?", (args.type, key)).fetchone()
+    rebuild_fts(conn)
     conn.commit()
     return dict(row)
 
 
 def cmd_entity_search(conn, args):
     init_schema(conn)
+    query = fts_query(args.query)
+    if query and ensure_fts_schema(conn):
+        params = [query]
+        type_clause = ""
+        if args.type:
+            type_clause = " AND entities.type=?"
+            params.append(args.type)
+        try:
+            return rows_to_dicts(conn.execute(
+                f"SELECT entities.* FROM entities_fts JOIN entities ON entities.id = entities_fts.entity_id WHERE entities_fts MATCH ?{type_clause} ORDER BY bm25(entities_fts) LIMIT ?",
+                params + [args.limit],
+            ))
+        except sqlite3.Error:
+            pass
     term = f"%{args.query}%"
     params = [term, term, term]
     type_clause = ""
@@ -370,6 +540,7 @@ def cmd_entity_delete(conn, args):
     if not args.force:
         raise SystemExit("entity delete requires --force")
     cur = conn.execute("DELETE FROM entities WHERE id=?", (args.id,))
+    rebuild_fts(conn)
     conn.commit()
     return {"deleted": cur.rowcount, "id": args.id}
 
@@ -489,11 +660,22 @@ def cmd_text_add(conn, args):
     index = args.index if args.index is not None else int(existing["max_index"]) + 1
     chunk_id = args.id or stable_id("chunk", f"{args.entity_id}:{source_id}:{index}:{args.text}")
     conn.execute("INSERT INTO text_chunks (id, entity_id, source_id, chunk_index, chunk_text, metadata) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(entity_id, source_id, chunk_index) DO UPDATE SET chunk_text=excluded.chunk_text, metadata=excluded.metadata", (chunk_id, args.entity_id, source_id, index, args.text, json_dumps(parse_json_object(args.metadata))))
+    rebuild_fts(conn)
     conn.commit()
     return {"inserted": chunk_id, "entityId": args.entity_id, "chunkIndex": index}
 
 
 def cmd_text_search(conn, args):
+    init_schema(conn)
+    query = fts_query(args.query)
+    if query and ensure_fts_schema(conn):
+        try:
+            return rows_to_dicts(conn.execute(
+                "SELECT text_chunks.id, text_chunks.entity_id, entities.title, text_chunks.chunk_index, substr(text_chunks.chunk_text, 1, ?) AS snippet FROM text_chunks_fts JOIN text_chunks ON text_chunks.id = text_chunks_fts.chunk_id JOIN entities ON entities.id = text_chunks.entity_id WHERE text_chunks_fts MATCH ? ORDER BY bm25(text_chunks_fts) LIMIT ?",
+                (args.snippet, query, args.limit),
+            ))
+        except sqlite3.Error:
+            pass
     term = f"%{args.query}%"
     return rows_to_dicts(conn.execute("SELECT text_chunks.id, text_chunks.entity_id, entities.title, text_chunks.chunk_index, substr(text_chunks.chunk_text, 1, ?) AS snippet FROM text_chunks JOIN entities ON entities.id = text_chunks.entity_id WHERE text_chunks.chunk_text LIKE ? ORDER BY text_chunks.created_at DESC LIMIT ?", (args.snippet, term, args.limit)))
 
@@ -517,6 +699,7 @@ def cmd_library_add(conn, args):
     )
     for tag in args.tag or []:
         conn.execute("INSERT OR IGNORE INTO tags (entity_id, tag, source_id) VALUES (?, ?, ?)", (entity_id, tag, source_id))
+    rebuild_fts(conn)
     conn.commit()
     return {"id": item_id, "entityId": entity_id, "title": title, "url": args.url}
 
@@ -533,6 +716,16 @@ def cmd_library_queue(conn, args):
 
 
 def cmd_library_search(conn, args):
+    init_schema(conn)
+    query = fts_query(args.query)
+    if query and ensure_fts_schema(conn):
+        try:
+            return rows_to_dicts(conn.execute(
+                "SELECT library_items.id, library_items.entity_id, library_items.title, library_items.author, library_items.publisher, library_items.url, library_items.status, library_items.in_queue, library_items.read, library_items.last_interaction_at FROM library_items_fts JOIN library_items ON library_items.id = library_items_fts.library_item_id WHERE library_items_fts MATCH ? ORDER BY bm25(library_items_fts) LIMIT ?",
+                (query, args.limit),
+            ))
+        except sqlite3.Error:
+            pass
     term = f"%{args.query}%"
     return rows_to_dicts(conn.execute("SELECT id, entity_id, title, author, publisher, url, status, in_queue, read, last_interaction_at FROM library_items WHERE title LIKE ? OR author LIKE ? OR publisher LIKE ? OR url LIKE ? ORDER BY last_interaction_at DESC, updated_at DESC LIMIT ?", (term, term, term, term, args.limit)))
 
@@ -568,7 +761,7 @@ def build_parser():
     parser.add_argument("--json", action="store_true", help="print JSON output")
     parser.add_argument("--dry-run", action="store_true", help="preview writes without changing data")
     parser.add_argument("--force", action="store_true", help="confirm destructive operation")
-    parser.add_argument("--version", action="version", version="personal-db 0.1.0")
+    parser.add_argument("--version", action="version", version="personal-db 0.2.0")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_force_arg(p):
@@ -579,6 +772,13 @@ def build_parser():
 
     sub.add_parser("init", help="initialize core schema").set_defaults(func=cmd_init)
     sub.add_parser("stats", help="show database stats").set_defaults(func=cmd_stats)
+    sub.add_parser("doctor", help="check schema, pragmas, integrity, and search indexes").set_defaults(func=cmd_doctor)
+    sub.add_parser("checkpoint", help="checkpoint and truncate the WAL file").set_defaults(func=cmd_checkpoint)
+    sub.add_parser("optimize", help="run SQLite and FTS optimize maintenance").set_defaults(func=cmd_optimize)
+
+    fts = sub.add_parser("fts", help="manage full-text search indexes").add_subparsers(dest="fts_command", required=True)
+    fts.add_parser("status").set_defaults(func=cmd_fts_status)
+    fts.add_parser("rebuild").set_defaults(func=cmd_fts_rebuild)
 
     table = sub.add_parser("table", help="manage tables").add_subparsers(dest="table_command", required=True)
     table.add_parser("list").set_defaults(func=cmd_table_list)

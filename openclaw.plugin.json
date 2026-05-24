@@ -1,0 +1,27 @@
+{
+  "id": "personal-db-plugin",
+  "version": "0.2.0",
+  "name": "Personal DB Plugin",
+  "description": "Local-first personal SQLite database tooling for OpenClaw agents.",
+  "kind": "tooling",
+  "activation": {
+    "onStartup": false
+  },
+  "contracts": {
+    "skills": [
+      "personal-database"
+    ],
+    "commands": [
+      "personal-db"
+    ]
+  },
+  "configSchema": {
+    "type": "object",
+    "properties": {
+      "dbPath": {
+        "type": "string",
+        "description": "Optional SQLite database path. Defaults to the workspace personal-data database when present."
+      }
+    }
+  }
+}

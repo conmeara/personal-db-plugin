@@ -1,6 +1,6 @@
 {
   "name": "personal-db-plugin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first personal SQLite database tooling for OpenClaw agents.",
   "author": {
     "name": "OpenClaw Personal Database Contributors",
@@ -8,7 +8,7 @@
     "url": "https://clawhub.ai"
   },
   "homepage": "https://clawhub.ai",
-  "repository": "https://clawhub.ai",
+  "repository": "https://github.com/conmeara/personal-db-plugin",
   "license": "MIT",
   "keywords": [
     "openclaw",

@@ -7,6 +7,7 @@ This plugin gives an OpenClaw agent a safe CLI for storing and querying personal
 ## What Ships
 
 - .codex-plugin/plugin.json - OpenClaw plugin manifest
+- openclaw.plugin.json - OpenClaw-native metadata for future plugin packaging
 - skills/personal-database/SKILL.md - agent instructions
 - scripts/personal_db.py - portable Python/SQLite CLI
 - tests/ - temp-database smoke tests
@@ -18,6 +19,7 @@ The plugin contains tooling and schema only. It must not include anyone's actual
 ~~~sh
 python3 scripts/personal_db.py --json init
 python3 scripts/personal_db.py --json stats
+python3 scripts/personal_db.py --json doctor
 python3 scripts/personal_db.py --json library queue "https://example.com/article" --title "Article title"
 python3 scripts/personal_db.py --json entity add --type hike --title "Mount Si"
 python3 scripts/personal_db.py --json entity search "Mount Si"
@@ -46,6 +48,14 @@ Use the generic tables first:
 
 Create custom tables when you need repeated structured measurements, for example workout_sets, hike_logs, meal_items, or restaurant_visits.
 
+## Storage Mechanics
+
+- Schema changes are versioned with PRAGMA user_version and a migrations table.
+- The CLI refuses to open databases created by a newer schema version.
+- Connections use WAL mode, synchronous=NORMAL, foreign keys, and a 5s busy timeout.
+- Search uses SQLite FTS5 indexes for entities, library items, and text chunks when available, with LIKE fallback.
+- Use doctor to check integrity, schema version, WAL mode, foreign keys, and FTS index presence.
+
 ## Examples
 
 ~~~sh
@@ -65,6 +75,10 @@ python3 scripts/personal_db.py --json row add hike_logs \
   --set entity_id="$entity_id" \
   --set date=2026-05-24 \
   --set distance_miles=6.2
+
+python3 scripts/personal_db.py --json fts rebuild
+python3 scripts/personal_db.py --json optimize
+python3 scripts/personal_db.py --json checkpoint
 ~~~
 
 ## Safety
@@ -72,6 +86,7 @@ python3 scripts/personal_db.py --json row add hike_logs \
 - Destructive operations require --force.
 - Core tables cannot be dropped with table drop.
 - Raw SQL is read-only by default. Writes require --write --force.
+- doctor is the preferred pre-publish/pre-backup health check.
 - Tests use temporary SQLite databases only.
 
 ## Test

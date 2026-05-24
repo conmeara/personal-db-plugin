@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
 
@@ -34,7 +35,8 @@ class PersonalDbCliTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def test_entity_fact_event_tag_text_flow(self):
-        self.json_cli("init")
+        initialized = self.json_cli("init")
+        self.assertEqual(initialized["schemaVersion"], 2)
         entity = self.json_cli("entity", "add", "--type", "hike", "--title", "Mount Si")
         entity_id = entity["id"]
 
@@ -52,6 +54,41 @@ class PersonalDbCliTests(unittest.TestCase):
         self.assertEqual(fetched["entity"]["title"], "Mount Si")
         self.assertEqual(fetched["facts"][0]["key"], "difficulty")
         self.assertIn("seattle", fetched["tags"])
+
+    def test_doctor_fts_and_maintenance_commands(self):
+        entity = self.json_cli("entity", "add", "--type", "hike", "--title", "Enchantments")
+        self.json_cli("text", "add", entity["id"], "--text", "Alpine lakes and strict permit planning.")
+        self.json_cli("library", "add", "https://example.com/alpine-lakes", "--title", "Alpine Lakes Guide")
+
+        entity_rows = self.json_cli("entity", "search", "Enchantments")
+        text_rows = self.json_cli("text", "search", "permit")
+        library_rows = self.json_cli("library", "search", "Alpine")
+        self.assertEqual(entity_rows[0]["id"], entity["id"])
+        self.assertEqual(text_rows[0]["entity_id"], entity["id"])
+        self.assertEqual(library_rows[0]["title"], "Alpine Lakes Guide")
+
+        status = self.json_cli("fts", "status")
+        self.assertTrue(status["available"])
+        self.assertTrue(all(status["tables"].values()))
+        self.assertTrue(self.json_cli("fts", "rebuild")["rebuilt"])
+
+        doctor = self.json_cli("doctor")
+        self.assertTrue(doctor["ok"])
+        self.assertEqual(doctor["schemaVersion"], 2)
+        self.assertEqual(doctor["journalMode"], "wal")
+        self.assertEqual(doctor["busyTimeoutMs"], 5000)
+        self.assertTrue(doctor["foreignKeys"])
+        self.assertEqual(doctor["integrityCheck"], "ok")
+
+        self.assertTrue(self.json_cli("optimize")["optimized"])
+        self.assertIn("checkpoint", self.json_cli("checkpoint"))
+
+    def test_rejects_newer_schema_version(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("PRAGMA user_version = 999")
+        result = self.run_cli("init", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("newer than this CLI supports", result.stderr)
 
     def test_text_add_without_source_upserts_same_index(self):
         entity = self.json_cli("entity", "add", "--type", "hike", "--title", "Mailbox Peak")

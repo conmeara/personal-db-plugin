@@ -26,17 +26,25 @@ When working inside a project that has its own database, pass --db explicitly:
 - Prefer CLI commands over hand-written SQL for writes.
 - Use --json for machine-readable output.
 - Run init before first use or after adding the plugin to a new workspace.
+- Use doctor before backups, migrations, or larger automated edits.
 - Treat entities, facts, events, links, tags, and text_chunks as the shared core model.
 - Add domain tables only when the core model becomes awkward for repeated structured data.
 - Use row commands for custom tables created by this CLI. For core tables, prefer entity/fact/event/link/tag/text/library commands.
 - Never publish or copy a user's actual SQLite DB, imports, article content, or logs into a plugin.
 - Destructive commands require --force; do not pass it unless the user explicitly asked for delete/drop behavior.
 - Raw sql is read-only by default. Use --write --force only for intentional migrations or emergency fixes.
+- Search commands use SQLite FTS5 when available and fall back to LIKE matching. If search looks stale after bulk SQL writes, run fts rebuild.
+- The database uses WAL mode and schema versioning. If the CLI reports a newer schema version, stop and update the plugin instead of forcing writes.
 
 ## Common Commands
 
     python3 plugins/personal-database/scripts/personal_db.py --json init
     python3 plugins/personal-database/scripts/personal_db.py --json stats
+    python3 plugins/personal-database/scripts/personal_db.py --json doctor
+    python3 plugins/personal-database/scripts/personal_db.py --json fts status
+    python3 plugins/personal-database/scripts/personal_db.py --json fts rebuild
+    python3 plugins/personal-database/scripts/personal_db.py --json optimize
+    python3 plugins/personal-database/scripts/personal_db.py --json checkpoint
     python3 plugins/personal-database/scripts/personal_db.py --json table list
     python3 plugins/personal-database/scripts/personal_db.py --json table describe library_items
     python3 plugins/personal-database/scripts/personal_db.py --json entity add --type hike --title "Mount Si" --url "https://example.com"
