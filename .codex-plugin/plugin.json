@@ -1,0 +1,38 @@
+{
+  "name": "personal-db-plugin",
+  "version": "0.1.0",
+  "description": "Local-first personal SQLite database tooling for OpenClaw agents.",
+  "author": {
+    "name": "OpenClaw Personal Database Contributors",
+    "email": "hello@example.com",
+    "url": "https://clawhub.ai"
+  },
+  "homepage": "https://clawhub.ai",
+  "repository": "https://clawhub.ai",
+  "license": "MIT",
+  "keywords": [
+    "openclaw",
+    "personal-data",
+    "sqlite",
+    "agent-memory",
+    "cli"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Personal DB Plugin",
+    "shortDescription": "Give OpenClaw agents a local SQLite store for personal data.",
+    "longDescription": "A local-first personal database plugin for OpenClaw. It gives agents a safe CLI for creating schemas, adding and searching entities, tracking facts/events/tags/text, and building domain tables such as reading lists, hikes, meals, and workouts without bundling private user data.",
+    "developerName": "OpenClaw Personal Database Contributors",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Search", "Local"],
+    "websiteURL": "https://clawhub.ai",
+    "privacyPolicyURL": "https://clawhub.ai",
+    "termsOfServiceURL": "https://clawhub.ai",
+    "defaultPrompt": [
+      "Add this article to my reading library.",
+      "Search my personal database for hikes.",
+      "Create a table for tracking workouts."
+    ],
+    "brandColor": "#2563EB"
+  }
+}
